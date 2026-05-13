@@ -31,7 +31,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "postinstall": "node scripts/install.js"
+    "postinstall": "node scripts/install.js",
+    "test": "zig build test",
+    "build": "zig build -Doptimize=ReleaseSafe",
+    "release": "node scripts/publish.mjs",
+    "release:dry-run": "node scripts/publish.mjs --dry-run",
+    "release:local": "node scripts/publish.mjs --local-only"
   },
   "os": [
     "darwin",
