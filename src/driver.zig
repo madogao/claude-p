@@ -207,19 +207,19 @@ const ink_enter_debounce_ms: u64 = 120;
 /// to settle" sleep from the original fix — adapts to whatever boot latency
 /// the machine actually has.
 fn waitForInkQuiescent(opts: Options, trace_start: i128, shared: *SharedState) void {
-    const quiescence_ns: i128 = @intCast(ink_quiescence_ms * std.time.ns_per_ms);
-    const max_ns: i128 = @intCast(ink_max_wait_ms * std.time.ns_per_ms);
-    const wait_started: i128 = std.time.nanoTimestamp();
+    const quiescence_ns: i64 = @intCast(ink_quiescence_ms * std.time.ns_per_ms);
+    const max_ns: i64 = @intCast(ink_max_wait_ms * std.time.ns_per_ms);
+    const wait_started: i64 = @intCast(std.time.nanoTimestamp());
     while (true) {
-        const now: i128 = std.time.nanoTimestamp();
+        const now: i64 = @intCast(std.time.nanoTimestamp());
         if (now - wait_started > max_ns) {
             traceFmt(opts, trace_start, "Ink readiness wait hit max ({d}ms) — typing anyway", .{ink_max_wait_ms});
             return;
         }
-        const last: i128 = shared.last_output_ns.load(.seq_cst);
+        const last: i64 = shared.last_output_ns.load(.seq_cst);
         if (last != 0 and now - last > quiescence_ns) {
-            const since_ms: i64 = @intCast(@divTrunc(now - last, std.time.ns_per_ms));
-            const waited_ms: i64 = @intCast(@divTrunc(now - wait_started, std.time.ns_per_ms));
+            const since_ms: i64 = @divTrunc(now - last, std.time.ns_per_ms);
+            const waited_ms: i64 = @divTrunc(now - wait_started, std.time.ns_per_ms);
             traceFmt(opts, trace_start, "Ink quiescent (output silent for {d}ms, waited {d}ms total)", .{ since_ms, waited_ms });
             return;
         }
@@ -255,11 +255,14 @@ const SharedState = struct {
     write_mutex: std.Thread.Mutex = .{},
     pending_to_pty: std.ArrayList(u8) = .{},
     bytes_seen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Timestamp (ns since arbitrary epoch — std.time.nanoTimestamp) of the
-    /// most recent pane_output event. Used by the main loop to decide when
-    /// Ink has gone quiescent (UI rendering done) and is therefore ready to
-    /// accept keystrokes — replaces a previous hardcoded 1500 ms sleep.
-    last_output_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
+    /// Timestamp (ns since arbitrary epoch — std.time.nanoTimestamp, truncated
+    /// to i64). Used by the main loop to decide when Ink has gone quiescent
+    /// (UI rendering done) and is therefore ready to accept keystrokes —
+    /// replaces a previous hardcoded 1500 ms sleep. Stored as i64 because
+    /// Zig's atomic load/store doesn't support 128-bit integers on all
+    /// targets (e.g. x86_64-linux-musl); i64 ns gives ~292 years of range,
+    /// vastly more than we need.
+    last_output_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Rolling buffer of recently-seen output. The driver loop scans this
     // for the workspace-trust dialog (shown in unfamiliar directories,
@@ -277,7 +280,7 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
     switch (event) {
         .pane_output => |po| {
             _ = shared.bytes_seen.fetchAdd(po.data.len, .seq_cst);
-            shared.last_output_ns.store(std.time.nanoTimestamp(), .seq_cst);
+            shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
             // Run the DEC-query responder; queue responses for the main loop.
             var resp: std.ArrayList(u8) = .{};
             defer resp.deinit(std.heap.page_allocator);
