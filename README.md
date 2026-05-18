@@ -45,18 +45,29 @@ npx claude-p --model opus "explain quicksort to a 10-year-old"
 ```
 --output-format <text|json|stream-json>   default: text
 --model <name>
+--fallback-model <name>
 --max-turns <N>
 --allowedTools <list>
+--disallowedTools <list>
+--permission-mode <acceptEdits|auto|bypassPermissions|default|dontAsk|plan>
 --dangerously-skip-permissions
+--system-prompt <text>
+--append-system-prompt <text>
+--add-dir <dir>...                        repeatable, variadic
+--mcp-config <cfg>...                     repeatable, variadic
+--setting-sources <user,project,local>
 --resume <id> | --continue | --session-id <uuid>
 --cwd <path>
 --input-file <path>
 --verbose
 --timeout <seconds>                       default: 300
 --debug
+--                                        end-of-options, remaining tokens go to PROMPT
 ```
 
-Unrecognized flags are forwarded verbatim to `claude`.
+Unrecognized flags are forwarded verbatim to `claude`. `-p`/`--print` and
+user-supplied `--settings` are rejected — claude-p emulates print mode and
+injects its own settings to register the Stop hook.
 
 ## Exit codes
 

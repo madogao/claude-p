@@ -22,6 +22,16 @@ pub const Options = struct {
     session_id: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     extra_args: []const []const u8 = &.{},
+    /// Explicit support for high-value claude flags. These are forwarded to
+    /// the child as the corresponding `claude` flag.
+    system_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
+    permission_mode: ?[]const u8 = null,
+    disallowed_tools: ?[]const u8 = null,
+    fallback_model: ?[]const u8 = null,
+    setting_sources: ?[]const u8 = null,
+    add_dirs: []const []const u8 = &.{},
+    mcp_configs: []const []const u8 = &.{},
     verbose: bool = false,
     timeout_ms: u64 = 300_000,
     /// Override `claude` binary path (testing).
@@ -113,6 +123,40 @@ pub fn buildArgv(
         try argv.append(allocator, id);
     }
     if (opts.verbose) try argv.append(allocator, "--verbose");
+
+    if (opts.system_prompt) |s| {
+        try argv.append(allocator, "--system-prompt");
+        try argv.append(allocator, s);
+    }
+    if (opts.append_system_prompt) |s| {
+        try argv.append(allocator, "--append-system-prompt");
+        try argv.append(allocator, s);
+    }
+    if (opts.permission_mode) |s| {
+        try argv.append(allocator, "--permission-mode");
+        try argv.append(allocator, s);
+    }
+    if (opts.disallowed_tools) |s| {
+        try argv.append(allocator, "--disallowedTools");
+        try argv.append(allocator, s);
+    }
+    if (opts.fallback_model) |s| {
+        try argv.append(allocator, "--fallback-model");
+        try argv.append(allocator, s);
+    }
+    if (opts.setting_sources) |s| {
+        try argv.append(allocator, "--setting-sources");
+        try argv.append(allocator, s);
+    }
+    for (opts.add_dirs) |d| {
+        try argv.append(allocator, "--add-dir");
+        try argv.append(allocator, d);
+    }
+    for (opts.mcp_configs) |c| {
+        try argv.append(allocator, "--mcp-config");
+        try argv.append(allocator, c);
+    }
+
     for (opts.extra_args) |a| try argv.append(allocator, a);
     return argv;
 }
@@ -747,6 +791,55 @@ test "buildArgv: passthrough extra args" {
     }
     try testing.expect(saw_hook);
     try testing.expect(saw_bare);
+}
+
+test "buildArgv: system-prompt + permission-mode forwarded" {
+    var argv = try buildArgv(testing.allocator, "claude", "{}", .{
+        .prompt = "x",
+        .system_prompt = "Be terse",
+        .permission_mode = "acceptEdits",
+        .disallowed_tools = "Bash(rm *)",
+    });
+    defer argv.deinit(testing.allocator);
+
+    var saw_sysp = false;
+    var saw_sysv = false;
+    var saw_pm = false;
+    var saw_pmv = false;
+    var saw_dt = false;
+    var saw_dtv = false;
+    for (argv.items) |a| {
+        if (std.mem.eql(u8, a, "--system-prompt")) saw_sysp = true;
+        if (std.mem.eql(u8, a, "Be terse")) saw_sysv = true;
+        if (std.mem.eql(u8, a, "--permission-mode")) saw_pm = true;
+        if (std.mem.eql(u8, a, "acceptEdits")) saw_pmv = true;
+        if (std.mem.eql(u8, a, "--disallowedTools")) saw_dt = true;
+        if (std.mem.eql(u8, a, "Bash(rm *)")) saw_dtv = true;
+    }
+    try testing.expect(saw_sysp and saw_sysv);
+    try testing.expect(saw_pm and saw_pmv);
+    try testing.expect(saw_dt and saw_dtv);
+}
+
+test "buildArgv: add-dirs + mcp-configs emit each entry as a flag pair" {
+    var argv = try buildArgv(testing.allocator, "claude", "{}", .{
+        .prompt = "x",
+        .add_dirs = &.{ "/a", "/b" },
+        .mcp_configs = &.{"server.json"},
+    });
+    defer argv.deinit(testing.allocator);
+
+    var add_count: u32 = 0;
+    var mcp_count: u32 = 0;
+    for (argv.items, 0..) |a, idx| {
+        if (std.mem.eql(u8, a, "--add-dir")) {
+            add_count += 1;
+            try testing.expect(idx + 1 < argv.items.len);
+        }
+        if (std.mem.eql(u8, a, "--mcp-config")) mcp_count += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), add_count);
+    try testing.expectEqual(@as(u32, 1), mcp_count);
 }
 
 test "shellQuoteArgv: simple" {

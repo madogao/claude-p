@@ -17,6 +17,8 @@ pub fn main() !void {
     };
     defer opts.deinit(allocator);
 
+    // (printError handles diagnostics; nothing else to do here.)
+
     if (opts.show_help) {
         try stdoutWriter().writeAll(claude_p.args.helpText());
         try stdoutWriter().flush();
@@ -71,6 +73,14 @@ pub fn main() !void {
         .session_id = opts.session_id,
         .cwd = opts.cwd,
         .extra_args = opts.passthrough.items,
+        .system_prompt = opts.system_prompt,
+        .append_system_prompt = opts.append_system_prompt,
+        .permission_mode = opts.permission_mode,
+        .disallowed_tools = opts.disallowed_tools,
+        .fallback_model = opts.fallback_model,
+        .setting_sources = opts.setting_sources,
+        .add_dirs = opts.add_dirs.items,
+        .mcp_configs = opts.mcp_configs.items,
         .verbose = opts.verbose,
         .timeout_ms = @as(u64, opts.timeout_seconds) * 1000,
         .debug = opts.debug,
@@ -91,7 +101,17 @@ pub fn main() !void {
 
 fn printError(err: anyerror) !void {
     var w = stderrWriter();
-    try w.print("claude-p: bad arguments: {s}\n", .{@errorName(err)});
+    // Human-readable messages for the validation errors users actually hit.
+    // Everything else falls back to the error name.
+    switch (err) {
+        error.StreamJsonRequiresVerbose => try w.writeAll(
+            "Error: --output-format=stream-json requires --verbose\n",
+        ),
+        error.UnsupportedFlag => try w.writeAll(
+            "Error: unsupported flag (claude-p emulates `claude -p` and injects its own --settings)\n",
+        ),
+        else => try w.print("claude-p: bad arguments: {s}\n", .{@errorName(err)}),
+    }
     try w.flush();
 }
 

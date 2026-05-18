@@ -19,6 +19,8 @@ pub const ParseError = error{
     BadOutputFormat,
     MissingValue,
     UnknownFlag,
+    UnsupportedFlag,
+    StreamJsonRequiresVerbose,
     BadInteger,
     BadFloat,
     OutOfMemory,
@@ -43,41 +45,97 @@ pub const Options = struct {
     debug: bool = false,
     show_help: bool = false,
     show_version: bool = false,
+
+    // Explicit support for high-value claude flags (better ergonomics than
+    // passthrough; some interact with claude semantics in subtle ways).
+    system_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
+    permission_mode: ?[]const u8 = null,
+    disallowed_tools: ?[]const u8 = null,
+    fallback_model: ?[]const u8 = null,
+    setting_sources: ?[]const u8 = null,
+    /// `--add-dir` may be repeated; we collect each value here in order.
+    add_dirs: std.ArrayList([]const u8) = .{},
+    /// `--mcp-config` may be repeated.
+    mcp_configs: std.ArrayList([]const u8) = .{},
+
     /// Arguments we don't recognize: passed through verbatim to `claude`.
     passthrough: std.ArrayList([]const u8) = .{},
 
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         // Strings come from the original argv slice (caller-owned), so we
-        // only need to free the passthrough list itself.
+        // only need to free the lists themselves.
         self.passthrough.deinit(allocator);
+        self.add_dirs.deinit(allocator);
+        self.mcp_configs.deinit(allocator);
     }
 };
+
+/// Long flags that `claude` accepts but take NO value. The greedy passthrough
+/// fallback below must NOT consume the next argv token for these — otherwise
+/// `claude-p --bare "hello"` swallows "hello" as a flag value.
+const known_boolean_long_flags = [_][]const u8{
+    "--bare",
+    "--brief",
+    "--chrome",
+    "--no-chrome",
+    "--allow-dangerously-skip-permissions",
+    "--dangerously-skip-permissions",
+    "--disable-slash-commands",
+    "--exclude-dynamic-system-prompt-sections",
+    "--fork-session",
+    "--ide",
+    "--include-hook-events",
+    "--include-partial-messages",
+    "--mcp-debug",
+    "--no-session-persistence",
+    "--replay-user-messages",
+    "--strict-mcp-config",
+    "--tmux",
+};
+
+fn isKnownBoolean(flag: []const u8) bool {
+    for (known_boolean_long_flags) |b| if (std.mem.eql(u8, b, flag)) return true;
+    return false;
+}
 
 const help_text =
     \\Usage: claude-p [OPTIONS] [PROMPT]
     \\
     \\Emulates `claude -p` by driving the interactive `claude` binary inside
-    \\an in-process libghostty terminal and capturing the final assistant
-    \\message via a Stop hook.
+    \\an in-process zmux PTY and capturing the final assistant message via a
+    \\Stop hook. With --output-format=stream-json, transcript lines are
+    \\emitted live as `claude` flushes them.
     \\
     \\Options:
     \\  --output-format <fmt>           text | json | stream-json (default: text)
     \\  --model <name>                  Forwarded to `claude --model`
+    \\  --fallback-model <name>         Forwarded to `claude --fallback-model`
     \\  --max-turns <N>                 Abort after N assistant turns
-    \\  --allowedTools <list>           Permission-rule list
+    \\  --allowedTools <list>           Permission-rule allow list
+    \\  --disallowedTools <list>        Permission-rule deny list
+    \\  --permission-mode <mode>        acceptEdits|auto|bypassPermissions|default|dontAsk|plan
     \\  --dangerously-skip-permissions  Bypass permission prompts
+    \\  --system-prompt <text>          Override the default system prompt
+    \\  --append-system-prompt <text>   Append to the default system prompt
+    \\  --add-dir <dir>...              Additional allowed directories (repeatable, variadic)
+    \\  --mcp-config <cfg>...           MCP server config files / JSON (repeatable, variadic)
+    \\  --setting-sources <sources>     Comma-separated: user,project,local
     \\  --resume <id>                   Resume a session
     \\  --continue, -c                  Continue the most recent session
     \\  --session-id <uuid>             Use a specific session UUID
     \\  --cwd <path>                    Working directory for `claude`
     \\  --input-file <path>             Read prompt from a file
-    \\  --verbose                       Verbose output (required for stream-json)
+    \\  --verbose                       Verbose output
     \\  --timeout <seconds>             Wrapper wall-time cap (default: 300)
     \\  --debug                         Wrapper debug logs to stderr
+    \\  --                              End of options; remaining tokens go to PROMPT
     \\  -h, --help                      Print this help
     \\  -v, --version                   Print version
     \\
-    \\Unrecognized flags are forwarded verbatim to `claude`.
+    \\Unrecognized flags are forwarded verbatim to `claude`. The wrapper rejects
+    \\`-p`/`--print` (we emulate it) and user-supplied `--settings` (we inject
+    \\our own to register the Stop hook).
     \\
 ;
 
@@ -90,9 +148,26 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
     var opts: Options = .{};
     errdefer opts.deinit(allocator);
 
+    var seen_separator = false;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
+
+        // After `--`, every remaining token is positional. Claude itself
+        // honors this; we mirror it so users can disambiguate prompts that
+        // could otherwise be eaten by a preceding variadic flag.
+        if (seen_separator) {
+            if (opts.prompt == null) {
+                opts.prompt = a;
+                continue;
+            } else {
+                return ParseError.UnknownFlag;
+            }
+        }
+        if (std.mem.eql(u8, a, "--")) {
+            seen_separator = true;
+            continue;
+        }
 
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             opts.show_help = true;
@@ -146,12 +221,56 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
             opts.timeout_seconds = std.fmt.parseInt(u32, argv[i], 10) catch return ParseError.BadInteger;
+        } else if (std.mem.eql(u8, a, "--system-prompt")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.system_prompt = argv[i];
+        } else if (std.mem.startsWith(u8, a, "--system-prompt=")) {
+            opts.system_prompt = a["--system-prompt=".len..];
+        } else if (std.mem.eql(u8, a, "--append-system-prompt")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.append_system_prompt = argv[i];
+        } else if (std.mem.eql(u8, a, "--permission-mode")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.permission_mode = argv[i];
+        } else if (std.mem.eql(u8, a, "--disallowedTools") or std.mem.eql(u8, a, "--disallowed-tools")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.disallowed_tools = argv[i];
+        } else if (std.mem.eql(u8, a, "--fallback-model")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.fallback_model = argv[i];
+        } else if (std.mem.eql(u8, a, "--setting-sources")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.setting_sources = argv[i];
+        } else if (std.mem.eql(u8, a, "--add-dir")) {
+            i = try consumeVariadicInto(allocator, argv, i, &opts.add_dirs);
+        } else if (std.mem.eql(u8, a, "--mcp-config")) {
+            i = try consumeVariadicInto(allocator, argv, i, &opts.mcp_configs);
+        } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--print")) {
+            // claude's print mode is what we *emulate*. Passing it through
+            // would either no-op or fight with our hooks. Reject loudly.
+            return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, a, "--settings")) {
+            // We inject our own --settings with the SessionStart/Stop hooks.
+            // Accepting a user --settings would clobber that and break the
+            // completion signal.
+            return ParseError.UnsupportedFlag;
         } else if (std.mem.startsWith(u8, a, "--")) {
-            // Unknown long option — forward (and absorb a value if next arg looks like one).
+            // Unknown long option — forward verbatim. For known boolean
+            // flags, do NOT absorb the following arg (otherwise we steal
+            // the user's prompt). For everything else, fall back to the
+            // greedy rule (works for `--flag value` shaped flags).
             try opts.passthrough.append(allocator, a);
-            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
-                i += 1;
-                try opts.passthrough.append(allocator, argv[i]);
+            if (!isKnownBoolean(a)) {
+                if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+                    i += 1;
+                    try opts.passthrough.append(allocator, argv[i]);
+                }
             }
         } else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
             // Short flag — forward.
@@ -165,7 +284,37 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
         }
     }
 
+    // Cross-flag validation. Mirror real claude's combination rules so
+    // claude-p stays a true drop-in: claude itself errors with
+    // "When using --print, --output-format=stream-json requires --verbose".
+    // We always emulate --print, so the same rule applies. --help/--version
+    // short-circuit before any work, so leave them alone.
+    if (!opts.show_help and !opts.show_version) {
+        if (opts.output_format == .stream_json and !opts.verbose) {
+            return ParseError.StreamJsonRequiresVerbose;
+        }
+    }
+
     return opts;
+}
+
+/// Consume a variadic flag's value list (mirrors commander.js variadic
+/// semantics: take every following non-flag token, until the next flag or
+/// end of argv). Returns the new value of `i`. Errors if no value follows.
+fn consumeVariadicInto(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    start: usize,
+    out: *std.ArrayList([]const u8),
+) ParseError!usize {
+    var i = start + 1;
+    if (i >= argv.len) return ParseError.MissingValue;
+    try out.append(allocator, argv[i]);
+    while (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+        i += 1;
+        try out.append(allocator, argv[i]);
+    }
+    return i;
 }
 
 // -------- tests --------
@@ -192,8 +341,8 @@ test "parse: --output-format json" {
     try testing.expectEqualStrings("hi", opts.prompt.?);
 }
 
-test "parse: --output-format=stream-json" {
-    var opts = try parse(testing.allocator, &.{"--output-format=stream-json"});
+test "parse: --output-format=stream-json (with --verbose, which claude requires)" {
+    var opts = try parse(testing.allocator, &.{ "--output-format=stream-json", "--verbose" });
     defer opts.deinit(testing.allocator);
     try testing.expectEqual(OutputFormat.stream_json, opts.output_format);
 }
@@ -265,4 +414,129 @@ test "parse: --input-file" {
     var opts = try parse(testing.allocator, &.{ "--input-file", "/tmp/p.md" });
     defer opts.deinit(testing.allocator);
     try testing.expectEqualStrings("/tmp/p.md", opts.input_file.?);
+}
+
+test "parse: known boolean passthrough flag does not consume next positional" {
+    // Regression: greedy passthrough used to swallow the prompt when an
+    // unknown long flag was actually a boolean (e.g. --bare "hi").
+    var opts = try parse(testing.allocator, &.{ "--bare", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 1), opts.passthrough.items.len);
+    try testing.expectEqualStrings("--bare", opts.passthrough.items[0]);
+}
+
+test "parse: --strict-mcp-config is boolean" {
+    var opts = try parse(testing.allocator, &.{ "--strict-mcp-config", "prompt-here" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("prompt-here", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 1), opts.passthrough.items.len);
+}
+
+test "parse: --include-hook-events boolean before prompt" {
+    var opts = try parse(testing.allocator, &.{ "--include-hook-events", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+}
+
+test "parse: variadic --add-dir consumes subsequent dir-shaped args" {
+    // Matches claude's variadic semantics: --add-dir eats all subsequent
+    // non-flag tokens. Put the prompt before --add-dir to avoid ambiguity.
+    var opts = try parse(testing.allocator, &.{ "hello", "--add-dir", "/a", "/b", "/c" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 3), opts.add_dirs.items.len);
+    try testing.expectEqualStrings("/a", opts.add_dirs.items[0]);
+    try testing.expectEqualStrings("/b", opts.add_dirs.items[1]);
+    try testing.expectEqualStrings("/c", opts.add_dirs.items[2]);
+}
+
+test "parse: -- separator forces remaining tokens into prompt slot" {
+    // Variadic flags eat positionals greedily, matching claude. Use `--`
+    // to terminate variadic absorption and unambiguously specify the prompt.
+    var opts = try parse(testing.allocator, &.{ "--add-dir", "/a", "/b", "--", "what is this?" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("what is this?", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 2), opts.add_dirs.items.len);
+}
+
+test "parse: --system-prompt is explicit" {
+    var opts = try parse(testing.allocator, &.{ "--system-prompt", "You are helpful", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("You are helpful", opts.system_prompt.?);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+}
+
+test "parse: --append-system-prompt is explicit" {
+    var opts = try parse(testing.allocator, &.{ "--append-system-prompt", "be terse", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("be terse", opts.append_system_prompt.?);
+}
+
+test "parse: --permission-mode is explicit" {
+    var opts = try parse(testing.allocator, &.{ "--permission-mode", "acceptEdits", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("acceptEdits", opts.permission_mode.?);
+}
+
+test "parse: --disallowedTools is explicit" {
+    var opts = try parse(testing.allocator, &.{ "--disallowedTools", "Bash Edit", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("Bash Edit", opts.disallowed_tools.?);
+}
+
+test "parse: --add-dir aggregates across repeats" {
+    // Put prompt first to avoid variadic absorption (mirrors real claude).
+    var opts = try parse(testing.allocator, &.{ "hi", "--add-dir", "/a", "--add-dir", "/b" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 2), opts.add_dirs.items.len);
+    try testing.expectEqualStrings("/a", opts.add_dirs.items[0]);
+    try testing.expectEqualStrings("/b", opts.add_dirs.items[1]);
+}
+
+test "parse: --fallback-model is explicit" {
+    var opts = try parse(testing.allocator, &.{ "--fallback-model", "sonnet", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("sonnet", opts.fallback_model.?);
+}
+
+test "parse: rejects --print (claude print mode is unavailable here)" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "-p", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--print", "hi" }));
+}
+
+test "parse: rejects user --settings (conflicts with our hook injection)" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--settings", "{}" }));
+}
+
+test "parse: stream-json without --verbose is rejected (matches claude -p)" {
+    // claude itself errors: "When using --print, --output-format=stream-json
+    // requires --verbose". We emulate --print so the same rule applies.
+    try testing.expectError(
+        ParseError.StreamJsonRequiresVerbose,
+        parse(testing.allocator, &.{ "--output-format", "stream-json", "hi" }),
+    );
+}
+
+test "parse: stream-json with --verbose is accepted" {
+    var opts = try parse(testing.allocator, &.{ "--output-format", "stream-json", "--verbose", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqual(OutputFormat.stream_json, opts.output_format);
+    try testing.expect(opts.verbose);
+}
+
+test "parse: --output-format=stream-json (eq form) also requires --verbose" {
+    try testing.expectError(
+        ParseError.StreamJsonRequiresVerbose,
+        parse(testing.allocator, &.{ "--output-format=stream-json", "hi" }),
+    );
+}
+
+test "parse: stream-json + --help skips the verbose check" {
+    // --help short-circuits before the validation kicks in — otherwise
+    // `claude-p --help --output-format stream-json` would error confusingly.
+    var opts = try parse(testing.allocator, &.{ "--output-format", "stream-json", "--help" });
+    defer opts.deinit(testing.allocator);
+    try testing.expect(opts.show_help);
 }
