@@ -30,6 +30,35 @@ pub fn main() !void {
         return;
     }
 
+    if (opts.is_daemon) {
+        const code = claude_p.daemon.run(allocator, .{
+            .model = opts.model,
+            .allowed_tools = opts.allowed_tools,
+            .skip_permissions = opts.dangerously_skip_permissions,
+            .resume_session = opts.resume_session,
+            .cont = opts.cont,
+            .session_id = opts.session_id,
+            .cwd = opts.cwd,
+            .extra_args = opts.passthrough.items,
+            .system_prompt = opts.system_prompt,
+            .append_system_prompt = opts.append_system_prompt,
+            .permission_mode = opts.permission_mode,
+            .disallowed_tools = opts.disallowed_tools,
+            .fallback_model = opts.fallback_model,
+            .setting_sources = opts.setting_sources,
+            .add_dirs = opts.add_dirs.items,
+            .mcp_configs = opts.mcp_configs.items,
+            .verbose = opts.verbose,
+            .session_start_timeout_ms = @as(u64, opts.timeout_seconds) * 1000,
+            .debug = opts.debug,
+        }) catch |err| {
+            try stderrWriter().print("claude-p daemon: {s}\n", .{@errorName(err)});
+            try stderrWriter().flush();
+            std.process.exit(2);
+        };
+        std.process.exit(code);
+    }
+
     // Resolve prompt: positional, file, or stdin.
     var prompt_buf: ?[]u8 = null;
     defer if (prompt_buf) |p| allocator.free(p);

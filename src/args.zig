@@ -31,6 +31,11 @@ pub const Options = struct {
     prompt: ?[]const u8 = null,
     /// Path to a file whose contents become the prompt (mutually exclusive with prompt).
     input_file: ?[]const u8 = null,
+    /// Long-lived multi-turn mode (triggered by first positional `daemon`).
+    /// In this mode the wrapper reads `{"type":"user",...}` JSONL frames from
+    /// stdin instead of taking a prompt up front, and emits a `result`
+    /// envelope after each turn's Stop hook.
+    is_daemon: bool = false,
     output_format: OutputFormat = .text,
     model: ?[]const u8 = null,
     max_turns: ?u32 = null,
@@ -101,11 +106,18 @@ fn isKnownBoolean(flag: []const u8) bool {
 
 const help_text =
     \\Usage: claude-p [OPTIONS] [PROMPT]
+    \\       claude-p daemon [OPTIONS]
     \\
-    \\Emulates `claude -p` by driving the interactive `claude` binary inside
-    \\an in-process zmux PTY and capturing the final assistant message via a
-    \\Stop hook. With --output-format=stream-json, transcript lines are
-    \\emitted live as `claude` flushes them.
+    \\Default mode: one-shot. Emulates `claude -p` by driving the interactive
+    \\`claude` binary inside an in-process zmux PTY and capturing the final
+    \\assistant message via a Stop hook.
+    \\
+    \\Daemon mode (prepend `daemon` as the first arg): long-lived multi-turn
+    \\wrapper. Reads `{"type":"user","message":{"role":"user","content":"..."}}`
+    \\JSONL frames from stdin and emits transcript JSONL + one `result`
+    \\envelope per turn to stdout — wire-compatible with
+    \\`claude -p --input-format stream-json --output-format stream-json
+    \\--verbose`.
     \\
     \\Options:
     \\  --output-format <fmt>           text | json | stream-json (default: text)
@@ -144,9 +156,19 @@ pub fn helpText() []const u8 {
 }
 
 /// Parse argv (already stripped of argv[0]).
-pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!Options {
+pub fn parse(allocator: std.mem.Allocator, argv_in: []const []const u8) ParseError!Options {
     var opts: Options = .{};
     errdefer opts.deinit(allocator);
+
+    // Subcommand: if the first positional token is `daemon`, drop into
+    // long-lived multi-turn mode. All other flags are parsed normally;
+    // prompt-related flags (positional / --input-file) are ignored by the
+    // daemon entry point in main.zig.
+    var argv: []const []const u8 = argv_in;
+    if (argv_in.len > 0 and std.mem.eql(u8, argv_in[0], "daemon")) {
+        opts.is_daemon = true;
+        argv = argv_in[1..];
+    }
 
     var seen_separator = false;
     var i: usize = 0;
@@ -288,8 +310,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
     // claude-p stays a true drop-in: claude itself errors with
     // "When using --print, --output-format=stream-json requires --verbose".
     // We always emulate --print, so the same rule applies. --help/--version
-    // short-circuit before any work, so leave them alone.
-    if (!opts.show_help and !opts.show_version) {
+    // short-circuit before any work, so leave them alone. Daemon mode is
+    // exempt — it sets stream-json internally and does not surface the flag
+    // to the user.
+    if (!opts.show_help and !opts.show_version and !opts.is_daemon) {
         if (opts.output_format == .stream_json and !opts.verbose) {
             return ParseError.StreamJsonRequiresVerbose;
         }

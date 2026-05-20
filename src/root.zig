@@ -13,6 +13,7 @@ pub const hook = @import("hook.zig");
 pub const terminal = @import("terminal.zig");
 pub const driver = @import("driver.zig");
 pub const stream = @import("stream.zig");
+pub const daemon = @import("daemon.zig");
 
 pub const Options = driver.Options;
 pub const Result = driver.Result;
