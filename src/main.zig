@@ -50,6 +50,7 @@ pub fn main() !void {
             .mcp_configs = opts.mcp_configs.items,
             .verbose = opts.verbose,
             .session_start_timeout_ms = @as(u64, opts.timeout_seconds) * 1000,
+            .idle_progress_timeout_ms = @as(u64, opts.idle_timeout_seconds) * 1000,
             .debug = opts.debug,
         }) catch |err| {
             try stderrWriter().print("claude-p daemon: {s}\n", .{@errorName(err)});

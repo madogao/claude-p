@@ -59,14 +59,16 @@ pub const Options = struct {
     /// Wall-time cap for the *initial* SessionStart wait. After that the
     /// daemon runs until stdin EOF or the child exits.
     session_start_timeout_ms: u64 = 300_000,
-    /// Per-turn wall-time cap, measured from when we type the prompt to
-    /// when the Stop hook fires. Set to 0 to disable.
-    turn_timeout_ms: u64 = 600_000,
+    /// While busy, kill the session if no PTY output has been observed for
+    /// this long. Detects a genuinely hung Ink TUI (Stop hook never fires)
+    /// without false-killing long turns that keep emitting tool progress.
+    /// Set to 0 to disable.
+    idle_progress_timeout_ms: u64 = 180_000,
 };
 
 pub const RunError = error{
     SessionStartTimeout,
-    TurnTimeout,
+    IdleTimeout,
     TranscriptUnavailable,
     SpawnFailed,
 } || std.mem.Allocator.Error;
@@ -397,11 +399,14 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
         if (state == .waiting_for_ready and now_ns > session_start_deadline_ns) {
             return RunError.SessionStartTimeout;
         }
-        if (state == .busy and opts.turn_timeout_ms > 0) {
-            const elapsed_ms: i64 = @intCast(@divTrunc(now_ns - turn_start_ns, std.time.ns_per_ms));
-            if (elapsed_ms > @as(i64, @intCast(opts.turn_timeout_ms))) {
-                traceFmt(opts, trace_start, "turn timeout after {d}ms", .{elapsed_ms});
-                return RunError.TurnTimeout;
+        if (state == .busy and opts.idle_progress_timeout_ms > 0) {
+            const last_out: i64 = shared.last_output_ns.load(.seq_cst);
+            if (last_out != 0) {
+                const idle_ms: i64 = @intCast(@divTrunc(now_ns - @as(i128, last_out), std.time.ns_per_ms));
+                if (idle_ms > @as(i64, @intCast(opts.idle_progress_timeout_ms))) {
+                    traceFmt(opts, trace_start, "idle timeout: no PTY activity for {d}ms", .{idle_ms});
+                    return RunError.IdleTimeout;
+                }
             }
         }
         if (shared.exited.load(.seq_cst)) {

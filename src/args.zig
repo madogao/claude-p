@@ -47,6 +47,9 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
     verbose: bool = false,
     timeout_seconds: u32 = 300,
+    /// Daemon mode only: kill the session if no PTY output for this many
+    /// seconds while busy. 0 disables. Default 180s.
+    idle_timeout_seconds: u32 = 180,
     debug: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -140,6 +143,9 @@ const help_text =
     \\  --input-file <path>             Read prompt from a file
     \\  --verbose                       Verbose output
     \\  --timeout <seconds>             Wrapper wall-time cap (default: 300)
+    \\  --idle-timeout <seconds>        Daemon-mode idle progress watchdog:
+    \\                                  kill if no PTY output for this long
+    \\                                  while busy. 0 disables. (default: 180)
     \\  --debug                         Wrapper debug logs to stderr
     \\  --                              End of options; remaining tokens go to PROMPT
     \\  -h, --help                      Print this help
@@ -243,6 +249,10 @@ pub fn parse(allocator: std.mem.Allocator, argv_in: []const []const u8) ParseErr
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
             opts.timeout_seconds = std.fmt.parseInt(u32, argv[i], 10) catch return ParseError.BadInteger;
+        } else if (std.mem.eql(u8, a, "--idle-timeout")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.idle_timeout_seconds = std.fmt.parseInt(u32, argv[i], 10) catch return ParseError.BadInteger;
         } else if (std.mem.eql(u8, a, "--system-prompt")) {
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
