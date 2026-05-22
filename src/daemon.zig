@@ -82,6 +82,24 @@ const State = enum {
     busy,
 };
 
+/// Decide whether a busy turn has stalled: no PTY output for longer than the
+/// idle-progress timeout. Only meaningful while `.busy` — `.idle` /
+/// `.waiting_for_ready` never time out here (an idle daemon legitimately
+/// produces no PTY output while waiting for the next prompt).
+///
+/// `last_output_ns == 0` (no output observed yet) never trips. The caller
+/// MUST reset `last_output_ns` to "now" when transitioning idle→busy;
+/// otherwise a long idle period leaves a stale timestamp that trips this on
+/// the very first busy loop even though the child is healthy and simply hasn't
+/// had time to respond to the new prompt yet.
+fn idleTimedOut(state: State, last_output_ns: i64, now_ns: i128, timeout_ms: u64) bool {
+    if (timeout_ms == 0) return false;
+    if (state != .busy) return false;
+    if (last_output_ns == 0) return false;
+    const idle_ms: i64 = @intCast(@divTrunc(now_ns - @as(i128, last_output_ns), std.time.ns_per_ms));
+    return idle_ms > @as(i64, @intCast(timeout_ms));
+}
+
 /// Translate daemon Options to a driver.Options (which buildArgv takes).
 /// Prompt stays empty — buildArgv never reads it, and the daemon never
 /// passes a prompt on argv anyway.
@@ -399,15 +417,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
         if (state == .waiting_for_ready and now_ns > session_start_deadline_ns) {
             return RunError.SessionStartTimeout;
         }
-        if (state == .busy and opts.idle_progress_timeout_ms > 0) {
-            const last_out: i64 = shared.last_output_ns.load(.seq_cst);
-            if (last_out != 0) {
-                const idle_ms: i64 = @intCast(@divTrunc(now_ns - @as(i128, last_out), std.time.ns_per_ms));
-                if (idle_ms > @as(i64, @intCast(opts.idle_progress_timeout_ms))) {
-                    traceFmt(opts, trace_start, "idle timeout: no PTY activity for {d}ms", .{idle_ms});
-                    return RunError.IdleTimeout;
-                }
-            }
+        if (idleTimedOut(state, shared.last_output_ns.load(.seq_cst), now_ns, opts.idle_progress_timeout_ms)) {
+            traceFmt(opts, trace_start, "idle timeout: no PTY activity since busy start", .{});
+            return RunError.IdleTimeout;
         }
         if (shared.exited.load(.seq_cst)) {
             if (state == .waiting_for_ready) return RunError.SpawnFailed;
@@ -634,6 +646,11 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
             std.Thread.sleep(driver_mod.ink_enter_debounce_ms * std.time.ns_per_ms);
             session.send("", true) catch {};
             turn_start_ns = std.time.nanoTimestamp();
+            // Reset the idle-progress baseline to "now". Without this, a long
+            // idle period (no PTY output) leaves last_output_ns stale and the
+            // first busy loop trips idleTimedOut even though the child is
+            // healthy and simply hasn't responded to the new prompt yet.
+            shared.last_output_ns.store(@intCast(turn_start_ns), .seq_cst);
             state = .busy;
         }
 
@@ -676,4 +693,37 @@ test "parseUserMessageContent: non-user type returns null" {
 
 test "parseUserMessageContent: malformed returns null" {
     try testing.expectEqual(@as(?[]u8, null), try parseUserMessageContent(testing.allocator, "not json"));
+}
+
+test "idleTimedOut: busy + stale last_output trips" {
+    const now: i128 = 1_000_000 * std.time.ns_per_ms; // 1_000_000 ms
+    const last_out: i64 = 0; // not yet observed → never trips
+    try testing.expect(!idleTimedOut(.busy, last_out, now, 180_000));
+    // 200s of silence > 180s timeout
+    const stale: i64 = @intCast(now - 200_000 * std.time.ns_per_ms);
+    try testing.expect(idleTimedOut(.busy, stale, now, 180_000));
+}
+
+test "idleTimedOut: busy + fresh baseline does not trip" {
+    const now: i128 = 1_000_000 * std.time.ns_per_ms;
+    // Just reset on dispatch (last_output == now) → 0ms idle.
+    try testing.expect(!idleTimedOut(.busy, @intCast(now), now, 180_000));
+    // 1s after a fresh baseline, well under timeout.
+    const one_s_ago: i64 = @intCast(now - 1_000 * std.time.ns_per_ms);
+    try testing.expect(!idleTimedOut(.busy, one_s_ago, now, 180_000));
+}
+
+test "idleTimedOut: idle/waiting never trip even with ancient timestamp" {
+    const now: i128 = 1_000_000 * std.time.ns_per_ms;
+    const ancient: i64 = @intCast(now - 3_600_000 * std.time.ns_per_ms); // 1h ago
+    // This is the Bug B regression: an idle daemon parked for an hour must NOT
+    // be considered timed out — only .busy is subject to the watchdog.
+    try testing.expect(!idleTimedOut(.idle, ancient, now, 180_000));
+    try testing.expect(!idleTimedOut(.waiting_for_ready, ancient, now, 180_000));
+}
+
+test "idleTimedOut: timeout 0 disables" {
+    const now: i128 = 1_000_000 * std.time.ns_per_ms;
+    const ancient: i64 = @intCast(now - 3_600_000 * std.time.ns_per_ms);
+    try testing.expect(!idleTimedOut(.busy, ancient, now, 0));
 }
