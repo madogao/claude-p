@@ -189,31 +189,31 @@ fn shellQuoteOne(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []con
 /// values type sooner; too small risks racing Ink's prompt-box draw. Tuned
 /// to 80 ms based on observed bursts (the input box renders in <50 ms of
 /// continuous output, then goes silent).
-const ink_quiescence_ms: u64 = 80;
+pub const ink_quiescence_ms: u64 = 80;
 
 /// Upper bound on how long we'll wait for quiescence. If Ink keeps emitting
 /// output past this, we give up and type anyway; in practice the prompt box
 /// is always up by then, and the failure mode is identical to the previous
 /// fixed-sleep behavior.
-const ink_max_wait_ms: u64 = 2000;
+pub const ink_max_wait_ms: u64 = 2000;
 
 /// How long to wait between sending the prompt bytes and sending Enter.
 /// Ink's bracketed-paste heuristic merges back-to-back writes; without a
 /// gap, `\r` lands in the input buffer instead of triggering submit.
-const ink_enter_debounce_ms: u64 = 120;
+pub const ink_enter_debounce_ms: u64 = 120;
 
 /// How long the PTY must be silent before we believe a pre-SessionStart
 /// modal dialog (workspace-trust or bypass-permissions) is fully rendered
 /// and ready to accept a keystroke. Typing into a mid-transition Ink frame
 /// can drop the key — observed when bypass dialog appears <200 ms after we
 /// dismiss the trust dialog and our `2` lands on a half-rendered screen.
-const dialog_quiescence_ms: u64 = 80;
+pub const dialog_quiescence_ms: u64 = 80;
 
 /// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
 /// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
 /// to settle" sleep from the original fix — adapts to whatever boot latency
 /// the machine actually has.
-fn waitForInkQuiescent(opts: Options, trace_start: i128, shared: *SharedState) void {
+pub fn waitForInkQuiescent(opts: Options, trace_start: i128, shared: *SharedState) void {
     const quiescence_ns: i64 = @intCast(ink_quiescence_ms * std.time.ns_per_ms);
     const max_ns: i64 = @intCast(ink_max_wait_ms * std.time.ns_per_ms);
     const wait_started: i64 = @intCast(std.time.nanoTimestamp());
@@ -255,7 +255,7 @@ fn traceFmt(opts: Options, start: i128, comptime fmt: []const u8, args: anytype)
 
 // Thread-shared state between the NativeSession reader thread and the
 // driver's main loop.
-const SharedState = struct {
+pub const SharedState = struct {
     session: *zmux.NativeSession,
     debug: bool,
     // Bytes the DEC responder wants written back to the PTY. Mutex-guarded.
@@ -279,11 +279,12 @@ const SharedState = struct {
     recent: std.ArrayList(u8) = .{},
     trust_dismissed: bool = false,
     bypass_perms_accepted: bool = false,
+    dev_channels_confirmed: bool = false,
 };
 
-const recent_capacity: usize = 8192;
+pub const recent_capacity: usize = 8192;
 
-fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
+pub fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
     const shared: *SharedState = @ptrCast(@alignCast(ctx));
     switch (event) {
         .pane_output => |po| {
@@ -488,7 +489,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         // Each detection also requires PTY quiescence (≥ dialog_quiescence_ms
         // since the last output byte) before sending a keystroke, so we
         // don't type into a partially-rendered Ink frame.
-        if (state == .waiting_for_ready and (!shared.trust_dismissed or !shared.bypass_perms_accepted)) {
+        if (state == .waiting_for_ready and (!shared.trust_dismissed or !shared.bypass_perms_accepted or !shared.dev_channels_confirmed)) {
             shared.recent_mutex.lock();
             const stripped = try stripCsi(allocator, shared.recent.items);
             shared.recent_mutex.unlock();
@@ -549,6 +550,29 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     shared.bypass_perms_accepted = true;
+                    fired_this_iter = true;
+                    shared.recent_mutex.lock();
+                    shared.recent.clearRetainingCapacity();
+                    shared.recent_mutex.unlock();
+                    shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
+                }
+            }
+
+            // 3. Development-channels confirmation dialog (triggered by
+            //    --dangerously-load-development-channels). Screen reads:
+            //      "WARNING: Loading development channels ...
+            //       ❯ 1. I am using this for local development
+            //         2. Exit
+            //       Enter to confirm · Esc to cancel"
+            //    Default selection = option 1, so a bare Enter accepts.
+            if (!shared.dev_channels_confirmed and !fired_this_iter) {
+                const has_loading = std.mem.indexOf(u8, stripped, "Loading") != null;
+                const has_development = std.mem.indexOf(u8, stripped, "development") != null;
+                const has_channels = std.mem.indexOf(u8, stripped, "channels") != null;
+                if (has_loading and has_development and has_channels and quiescent) {
+                    trace(opts, trace_start, "dev-channels dialog detected — sending Enter to confirm");
+                    session.send("", true) catch {};
+                    shared.dev_channels_confirmed = true;
                     fired_this_iter = true;
                     shared.recent_mutex.lock();
                     shared.recent.clearRetainingCapacity();
@@ -767,7 +791,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
 /// Strip CSI / OSC / DCS escape sequences, leaving only literal payload.
 /// Used to make plain-text substring matching (e.g. trust-dialog detection)
 /// robust against cursor-positioning escapes that pad words with `\033[1C`.
-fn stripCsi(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+pub fn stripCsi(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .{};
     errdefer out.deinit(allocator);
 
